@@ -13,8 +13,6 @@ use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
-use phantun::UDP_TTL;
-
 #[tokio::main]
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
@@ -101,6 +99,15 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("udp_ttl")
+                .value_parser(clap::value_parser!(u64))
+                .long("udp-ttl")
+                .required(false)
+                .value_name("SECONDS")
+                .help("TTL(time-to-live) for UDP packets, in seconds")
+                .default_value("180")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -147,6 +154,9 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+
+    let udp_ttl = std::time::Duration::from_secs(*matches.get_one::<u64>("udp_ttl").unwrap());
+    info!("UDP ttl set to {:?} ", udp_ttl);
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -218,13 +228,15 @@ async fn main() -> io::Result<()> {
             // spawn "fastpath" UDP socket and task, this will offload main task
             // from forwarding UDP packets
 
-            let packet_received = Arc::new(Notify::new());
+            let incoming_packet_received = Arc::new(Notify::new());
+            let outgoing_packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
-                let packet_received = packet_received.clone();
+                let incoming_packet_received = incoming_packet_received.clone();
+                let outgoing_packet_received = outgoing_packet_received.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -241,7 +253,7 @@ async fn main() -> io::Result<()> {
                                     return;
                                 }
 
-                                packet_received.notify_one();
+                                outgoing_packet_received.notify_one();
                             },
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
@@ -261,7 +273,7 @@ async fn main() -> io::Result<()> {
                                     },
                                 }
 
-                                packet_received.notify_one();
+                                incoming_packet_received.notify_one();
                             },
                             _ = quit.cancelled() => {
                                 debug!("worker {} terminated", i);
@@ -275,24 +287,27 @@ async fn main() -> io::Result<()> {
             let connections = connections.clone();
             tokio::spawn(async move {
                 loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
+                    let packet_received_fut = || async {
+                        incoming_packet_received.notified().await;
+                        outgoing_packet_received.notified().await;
+                    };
 
                     tokio::select! {
-                        _ = read_timeout => {
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-                            connections.write().await.remove(&addr);
-                            debug!("removed fake TCP socket from connections table");
+                        r = time::timeout(udp_ttl, packet_received_fut()) => {
+                            if r.is_err() {
+                                info!("No traffic seen in the last {:?}, closing connection", udp_ttl);
+                                connections.write().await.remove(&addr);
+                                debug!("removed fake TCP socket from connections table");
 
-                            quit.cancel();
-                            return;
-                        },
+                                quit.cancel();
+                                return;
+                            }
+                        }
                         _ = quit.cancelled() => {
                             connections.write().await.remove(&addr);
                             debug!("removed fake TCP socket from connections table");
                             return;
                         },
-                        _ = packet_received_fut => {},
                     }
                 }
             });
