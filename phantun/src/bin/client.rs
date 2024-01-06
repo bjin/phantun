@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
@@ -108,6 +109,13 @@ async fn main() -> io::Result<()> {
                 .help("TTL(time-to-live) for UDP packets, in seconds")
                 .default_value("180")
         )
+        .arg(
+            Arg::new("ignore_first_packet")
+                .long("ignore-first-packet")
+                .required(false)
+                .help("Ignore first packet from server")
+                .action(ArgAction::SetTrue)
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -154,6 +162,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let ignore_first_packet = matches.get_flag("ignore_first_packet");
 
     let udp_ttl = std::time::Duration::from_secs(*matches.get_one::<u64>("udp_ttl").unwrap());
     info!("UDP ttl set to {:?} ", udp_ttl);
@@ -230,12 +239,14 @@ async fn main() -> io::Result<()> {
             let incoming_packet_received = Arc::new(Notify::new());
             let outgoing_packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
+            let ignore_next_packet = Arc::new(AtomicBool::new(ignore_first_packet));
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let incoming_packet_received = incoming_packet_received.clone();
                 let outgoing_packet_received = outgoing_packet_received.clone();
+                let ignore_next_packet = ignore_next_packet.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -283,12 +294,15 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                        if size > 0 {
+                                            if ignore_next_packet.swap(false, Ordering::Relaxed) {
+                                                debug!("Ignored first packet from server");
+                                            } else if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
                                             }
+                                        }
                                     },
                                     None => {
                                         debug!("removed fake TCP socket from connections table");
