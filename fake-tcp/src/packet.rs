@@ -133,17 +133,13 @@ pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)
         if v4.get_next_level_protocol() != ip::IpNextHeaderProtocols::Tcp {
             return None;
         }
-
-        let tcp = tcp::TcpPacket::new(&buf[IPV4_HEADER_LEN..]).unwrap();
-        Some((IPPacket::V4(v4), tcp))
+        tcp::TcpPacket::new(&buf[IPV4_HEADER_LEN..]).map(|tcp| (IPPacket::V4(v4), tcp))
     } else if buf[0] >> 4 == 6 {
         let v6 = ipv6::Ipv6Packet::new(buf).unwrap();
         if v6.get_next_header() != ip::IpNextHeaderProtocols::Tcp {
             return None;
         }
-
-        let tcp = tcp::TcpPacket::new(&buf[IPV6_HEADER_LEN..]).unwrap();
-        Some((IPPacket::V6(v6), tcp))
+        tcp::TcpPacket::new(&buf[IPV6_HEADER_LEN..]).map(|tcp| (IPPacket::V6(v6), tcp))
     } else {
         None
     }
