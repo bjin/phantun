@@ -127,6 +127,7 @@ impl Socket {
         tun: Arc<Tun>,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
+        seq: u32,
         ack: Option<u32>,
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
@@ -139,7 +140,7 @@ impl Socket {
                 incoming: incoming_rx,
                 local_addr,
                 remote_addr,
-                seq: AtomicU32::new(0),
+                seq: AtomicU32::new(seq),
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state,
@@ -431,6 +432,7 @@ impl Stack {
                     self.shared.tun.choose(&mut rng).unwrap().clone(),
                     local_addr,
                     addr,
+                    rng.random::<u32>() / 4095 * 4095,
                     None,
                     State::Idle,
                 );
@@ -503,12 +505,13 @@ impl Stack {
                                     .contains(&tcp_packet.get_destination())
                             {
                                 // SYN seen on listening socket
-                                if tcp_packet.get_sequence() == 0 {
+                                if tcp_packet.get_sequence() % 4095 == 0 {
                                     let (sock, incoming) = Socket::new(
                                         shared.clone(),
                                         tun.clone(),
                                         local_addr,
                                         remote_addr,
+                                        rand::random(),
                                         Some(tcp_packet.get_sequence() + 1),
                                         State::Idle,
                                     );
