@@ -15,6 +15,11 @@ def find_binary(name):
             return bin_path
     raise FileNotFoundError(f"Could not find {name}. Did you run 'cargo build'?")
 
+# Subnets used for the integration tests. These are configurable
+# in case the defaults conflict with the host's existing networks.
+CLIENT_SUBNET = os.environ.get("PHANTUN_CLIENT_SUBNET", "10.100.0")
+SERVER_SUBNET = os.environ.get("PHANTUN_SERVER_SUBNET", "10.100.1")
+
 class PhantunE2ETest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -29,40 +34,47 @@ class PhantunE2ETest(unittest.TestCase):
         self.server_ns = NetNS()
         self.processes = []
 
-        # Setup Veth for Client
+        # Setup Veth for Client: 'veth-c' stays in host, 'veth-c-peer' is moved to the client namespace
         subprocess.run(["ip", "link", "add", "veth-c", "type", "veth", "peer", "name", "veth-c-peer"], check=True)
         subprocess.run(["ip", "link", "set", "veth-c-peer", "netns", str(self.client_ns.pid)], check=True)
-        subprocess.run(["ip", "addr", "add", "10.100.0.1/24", "dev", "veth-c"], check=True)
+        subprocess.run(["ip", "addr", "add", f"{CLIENT_SUBNET}.1/24", "dev", "veth-c"], check=True)
         subprocess.run(["ip", "link", "set", "veth-c", "up"], check=True)
 
-        # Setup Veth for Server
+        # Setup Veth for Server: 'veth-s' stays in host, 'veth-s-peer' is moved to the server namespace
         subprocess.run(["ip", "link", "add", "veth-s", "type", "veth", "peer", "name", "veth-s-peer"], check=True)
         subprocess.run(["ip", "link", "set", "veth-s-peer", "netns", str(self.server_ns.pid)], check=True)
-        subprocess.run(["ip", "addr", "add", "10.100.1.1/24", "dev", "veth-s"], check=True)
+        subprocess.run(["ip", "addr", "add", f"{SERVER_SUBNET}.1/24", "dev", "veth-s"], check=True)
         subprocess.run(["ip", "link", "set", "veth-s", "up"], check=True)
 
+        # Enable IP forwarding on the host to allow routing between namespaces
         subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True)
 
-        # Configure Client NS
+        # Configure Client NS: setup loopback, veth interface, routing, and NAT
         self.client_ns.run(["ip", "link", "set", "lo", "up"], check=True)
-        self.client_ns.run(["ip", "addr", "add", "10.100.0.2/24", "dev", "veth-c-peer"], check=True)
+        self.client_ns.run(["ip", "addr", "add", f"{CLIENT_SUBNET}.2/24", "dev", "veth-c-peer"], check=True)
         self.client_ns.run(["ip", "link", "set", "veth-c-peer", "up"], check=True)
-        self.client_ns.run(["ip", "route", "add", "default", "via", "10.100.0.1"], check=True)
+        self.client_ns.run(["ip", "route", "add", "default", "via", f"{CLIENT_SUBNET}.1"], check=True)
         self.client_ns.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True)
+        # Masquerade traffic leaving the client namespace so replies can be routed back
         self.client_ns.run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "veth-c-peer", "-j", "MASQUERADE"], check=True)
 
-        # Configure Server NS
+        # Configure Server NS: setup loopback, veth interface, routing, and NAT
         self.server_ns.run(["ip", "link", "set", "lo", "up"], check=True)
-        self.server_ns.run(["ip", "addr", "add", "10.100.1.2/24", "dev", "veth-s-peer"], check=True)
+        self.server_ns.run(["ip", "addr", "add", f"{SERVER_SUBNET}.2/24", "dev", "veth-s-peer"], check=True)
         self.server_ns.run(["ip", "link", "set", "veth-s-peer", "up"], check=True)
-        self.server_ns.run(["ip", "route", "add", "default", "via", "10.100.1.1"], check=True)
+        self.server_ns.run(["ip", "route", "add", "default", "via", f"{SERVER_SUBNET}.1"], check=True)
         self.server_ns.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True)
+        # Port forward incoming fake TCP traffic on port 4567 to the TUN interface IP (192.168.201.2).
+        # Note: 192.168.201.2 is the default `tun_peer` IP as specified in the phantun_server CLI.
         self.server_ns.run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-i", "veth-s-peer", "--dport", "4567", "-j", "DNAT", "--to-destination", "192.168.201.2"], check=True)
 
+        # Start the backend UDP echo server in the server namespace
         self.echo_server_stop = threading.Event()
         self.echo_server_thread = threading.Thread(target=self.run_echo_server)
         self.echo_server_thread.start()
 
+        # Start Phantun server in the server namespace
+        # It listens on fake-TCP port 4567 and forwards to UDP 127.0.0.1:9000
         ps = self.server_ns.popen([
             self.server_bin,
             "--local", "4567",
@@ -70,10 +82,12 @@ class PhantunE2ETest(unittest.TestCase):
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.processes.append(ps)
 
+        # Start Phantun client in the client namespace
+        # It listens on UDP 127.0.0.1:1234 and forwards to fake-TCP server
         pc = self.client_ns.popen([
             self.client_bin,
             "--local", "127.0.0.1:1234",
-            "--remote", "10.100.1.2:4567"
+            "--remote", f"{SERVER_SUBNET}.2:4567"
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.processes.append(pc)
 
@@ -188,6 +202,7 @@ class PhantunE2ETest(unittest.TestCase):
             t = threading.Thread(target=worker, args=(i, results))
             threads.append(t)
             t.start()
+            time.sleep(0.02)
         for t in threads:
             t.join()
         return results
@@ -265,7 +280,7 @@ class PhantunE2ETest(unittest.TestCase):
             t = threading.Thread(target=worker, args=(i, results))
             threads.append(t)
             t.start()
-            time.sleep(0.01)
+            time.sleep(0.02)
         for t in threads:
             t.join()
         return results
