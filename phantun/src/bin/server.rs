@@ -1,13 +1,13 @@
-use clap::{crate_version, Arg, ArgAction, Command};
-use fake_tcp::packet::MAX_PACKET_LEN;
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::Stack;
+use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
+use phantun::handshake_packet::HandshakePacketTracker;
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::time;
@@ -113,7 +113,7 @@ async fn main() -> io::Result<()> {
             Arg::new("ignore_first_packet")
                 .long("ignore-first-packet")
                 .required(false)
-                .help("Ignore first packet from client")
+                .help("Ignore the client handshake packet")
                 .action(ArgAction::SetTrue)
         )
         .get_matches();
@@ -208,7 +208,9 @@ async fn main() -> io::Result<()> {
             let incoming_packet_received = Arc::new(Notify::new());
             let outgoing_packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
-            let ignore_next_packet = Arc::new(AtomicBool::new(ignore_first_packet));
+            let handshake_packet_tracker = Arc::new(HandshakePacketTracker::new(
+                ignore_first_packet.then_some(sock.next_remote_seq()),
+            ));
             let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -223,7 +225,7 @@ async fn main() -> io::Result<()> {
                 let quit = quit.clone();
                 let incoming_packet_received = incoming_packet_received.clone();
                 let outgoing_packet_received = outgoing_packet_received.clone();
-                let ignore_next_packet = ignore_next_packet.clone();
+                let handshake_packet_tracker = handshake_packet_tracker.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
@@ -239,12 +241,12 @@ async fn main() -> io::Result<()> {
 
                                 outgoing_packet_received.notify_one();
                             },
-                            res = sock.recv(&mut buf_tcp) => {
+                            res = sock.recv_with_seq(&mut buf_tcp) => {
                                 match res {
-                                    Some(size) => {
+                                    Some((size, sequence)) => {
                                         if size > 0 {
-                                            if ignore_next_packet.swap(false, Ordering::Relaxed) {
-                                                debug!("Ignored first packet from client");
+                                            if handshake_packet_tracker.should_drop(sequence) {
+                                                debug!("Ignored handshake packet from client with sequence {}", sequence);
                                             } else if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
@@ -276,7 +278,10 @@ async fn main() -> io::Result<()> {
                         outgoing_packet_received.notified().await;
                     };
                     if time::timeout(udp_ttl, packet_received_fut()).await.is_err() {
-                        info!("No traffic seen in the last {:?}, closing connection", udp_ttl);
+                        info!(
+                            "No traffic seen in the last {:?}, closing connection",
+                            udp_ttl
+                        );
 
                         quit.cancel();
                         return;

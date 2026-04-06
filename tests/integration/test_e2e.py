@@ -1,9 +1,11 @@
 import os
-import time
+import queue
 import socket
-import threading
-import unittest
 import subprocess
+import tempfile
+import threading
+import time
+import unittest
 
 from framework import setup_userns, NetNS, enter_ns
 
@@ -20,7 +22,7 @@ def find_binary(name):
 CLIENT_SUBNET = os.environ.get("PHANTUN_CLIENT_SUBNET", "10.100.0")
 SERVER_SUBNET = os.environ.get("PHANTUN_SERVER_SUBNET", "10.100.1")
 
-class PhantunE2ETest(unittest.TestCase):
+class PhantunE2ETestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.client_bin = find_binary("client")
@@ -30,9 +32,16 @@ class PhantunE2ETest(unittest.TestCase):
             raise unittest.SkipTest("/dev/net/tun does not exist. TUN device support is required for integration tests.")
 
     def setUp(self):
+        self.processes = []
+        self.temp_paths = []
+        self._setup_namespaces()
+        self.start_backend_server(self.run_echo_server)
+        self.start_phantun_processes()
+        time.sleep(1.0)
+
+    def _setup_namespaces(self):
         self.client_ns = NetNS()
         self.server_ns = NetNS()
-        self.processes = []
 
         # Setup Veth for Client: 'veth-c' stays in host, 'veth-c-peer' is moved to the client namespace
         subprocess.run(["ip", "link", "add", "veth-c", "type", "veth", "peer", "name", "veth-c-peer"], check=True)
@@ -68,35 +77,44 @@ class PhantunE2ETest(unittest.TestCase):
         # Note: 192.168.201.2 is the default `tun_peer` IP as specified in the phantun_server CLI.
         self.server_ns.run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-i", "veth-s-peer", "--dport", "4567", "-j", "DNAT", "--to-destination", "192.168.201.2"], check=True)
 
-        # Start the backend UDP echo server in the server namespace
-        self.echo_server_stop = threading.Event()
-        self.echo_server_thread = threading.Thread(target=self.run_echo_server)
-        self.echo_server_thread.start()
+    def start_backend_server(self, target):
+        self.backend_server_stop = threading.Event()
+        self.backend_server_thread = threading.Thread(target=target)
+        self.backend_server_thread.start()
 
-        # Start Phantun server in the server namespace
-        # It listens on fake-TCP port 4567 and forwards to UDP 127.0.0.1:9000
-        ps = self.server_ns.popen([
+    def start_phantun_processes(self, server_extra_args=None, client_extra_args=None):
+        server_args = [
             self.server_bin,
             "--local", "4567",
-            "--remote", "127.0.0.1:9000"
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            "--remote", "127.0.0.1:9000",
+        ]
+        if server_extra_args:
+            server_args.extend(server_extra_args)
+        ps = self.server_ns.popen(server_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.processes.append(ps)
 
-        # Start Phantun client in the client namespace
-        # It listens on UDP 127.0.0.1:1234 and forwards to fake-TCP server
-        pc = self.client_ns.popen([
+        client_args = [
             self.client_bin,
             "--local", "127.0.0.1:1234",
-            "--remote", f"{SERVER_SUBNET}.2:4567"
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            "--remote", f"{SERVER_SUBNET}.2:4567",
+        ]
+        if client_extra_args:
+            client_args.extend(client_extra_args)
+        pc = self.client_ns.popen(client_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.processes.append(pc)
 
-        # Wait for initialization
-        time.sleep(1.0)
+    def write_temp_file(self, payload):
+        fd, path = tempfile.mkstemp(prefix="phantun-test-", suffix=".bin")
+        with os.fdopen(fd, "wb") as file_obj:
+            file_obj.write(payload)
+        self.temp_paths.append(path)
+        return path
 
     def tearDown(self):
-        self.echo_server_stop.set()
-        self.echo_server_thread.join()
+        if hasattr(self, "backend_server_stop"):
+            self.backend_server_stop.set()
+        if hasattr(self, "backend_server_thread"):
+            self.backend_server_thread.join()
 
         for p in self.processes:
             p.terminate()
@@ -106,11 +124,19 @@ class PhantunE2ETest(unittest.TestCase):
                 p.kill()
             out, err = p.communicate()
             if out:
-                print(f"\\n--- STDOUT/ERR of {p.args[0]} ---")
+                print(f"\n--- STDOUT/ERR of {p.args[0]} ---")
                 print(out.decode())
 
-        self.client_ns.cleanup()
-        self.server_ns.cleanup()
+        for path in self.temp_paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+        if hasattr(self, "client_ns"):
+            self.client_ns.cleanup()
+        if hasattr(self, "server_ns"):
+            self.server_ns.cleanup()
 
         subprocess.run(["ip", "link", "del", "veth-c"], stderr=subprocess.DEVNULL)
         subprocess.run(["ip", "link", "del", "veth-s"], stderr=subprocess.DEVNULL)
@@ -122,7 +148,7 @@ class PhantunE2ETest(unittest.TestCase):
             sock.bind(("127.0.0.1", 9000))
             sock.settimeout(0.1)
 
-            while not self.echo_server_stop.is_set():
+            while not self.backend_server_stop.is_set():
                 try:
                     data, addr = sock.recvfrom(65535)
                     sock.sendto(data, addr)
@@ -146,6 +172,7 @@ class PhantunE2ETest(unittest.TestCase):
             raise result['err']
         return result.get('ret')
 
+class PhantunE2ETest(PhantunE2ETestBase):
     def _do_smoke_test(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(2.0)
@@ -251,6 +278,7 @@ class PhantunE2ETest(unittest.TestCase):
 
     def _do_stress_concurrent_streams(self):
         import random
+
         def worker(idx, results_dict):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.bind(("0.0.0.0", 0))
@@ -293,6 +321,116 @@ class PhantunE2ETest(unittest.TestCase):
             self.assertIsNone(err, f"Stream {i} failed with error: {err}")
             self.assertEqual(len(received), 100, f"Stream {i} expected 100 packets, got {len(received)}")
             self.assertEqual(sent, received, f"Stream {i} sent and received payloads do not match")
+
+class PhantunHandshakePacketE2ETest(PhantunE2ETestBase):
+    CLIENT_HANDSHAKE_PACKET = b"client-handshake-packet"
+    SERVER_HANDSHAKE_PACKET = b"server-handshake-packet"
+    APPLICATION_PAYLOAD = b"application-payload"
+    APPLICATION_ECHO = b"echo:application-payload"
+
+    def setUp(self):
+        self.processes = []
+        self.temp_paths = []
+        self._setup_namespaces()
+        self.backend_received_packets = queue.Queue()
+        self.start_backend_server(self.run_handshake_backend_server)
+
+    def run_handshake_backend_server(self):
+        enter_ns(self.server_ns.pid)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(("127.0.0.1", 9000))
+            sock.settimeout(0.1)
+
+            while not self.backend_server_stop.is_set():
+                try:
+                    data, addr = sock.recvfrom(65535)
+                    self.backend_received_packets.put(data)
+                    if data == self.APPLICATION_PAYLOAD:
+                        sock.sendto(self.APPLICATION_ECHO, addr)
+                except socket.timeout:
+                    pass
+
+    def start_handshake_phantun(self, ignore_client=False, ignore_server=False):
+        server_args = [
+            "--handshake-packet", self.write_temp_file(self.SERVER_HANDSHAKE_PACKET),
+        ]
+        client_args = [
+            "--handshake-packet", self.write_temp_file(self.CLIENT_HANDSHAKE_PACKET),
+        ]
+        if ignore_server:
+            server_args.append("--ignore-first-packet")
+        if ignore_client:
+            client_args.append("--ignore-first-packet")
+
+        self.start_phantun_processes(server_args, client_args)
+        time.sleep(1.0)
+
+    def _do_client_round_trip(self, expected_packets):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(2.0)
+            sock.sendto(self.APPLICATION_PAYLOAD, ("127.0.0.1", 1234))
+
+            packets = []
+            while len(packets) < expected_packets:
+                data, _ = sock.recvfrom(65535)
+                packets.append(data)
+
+            drain_deadline = time.time() + 0.5
+            sock.settimeout(0.05)
+            while time.time() < drain_deadline:
+                try:
+                    data, _ = sock.recvfrom(65535)
+                    packets.append(data)
+                except socket.timeout:
+                    pass
+
+            return packets
+
+    def collect_backend_packets(self, expected_packets):
+        packets = []
+        deadline = time.time() + 2.0
+        while len(packets) < expected_packets:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                packets.append(self.backend_received_packets.get(timeout=remaining))
+            except queue.Empty:
+                break
+
+            drain_deadline = time.time() + 0.5
+            while time.time() < drain_deadline:
+                try:
+                    packets.append(self.backend_received_packets.get(timeout=0.05))
+                except queue.Empty:
+                    pass
+
+        return packets
+
+    def test_handshake_packets_are_injected_without_ignore(self):
+        self.start_handshake_phantun()
+
+        client_packets = self.run_in_client(self._do_client_round_trip, 2)
+        backend_packets = self.collect_backend_packets(2)
+
+        self.assertCountEqual(
+            client_packets,
+            [self.SERVER_HANDSHAKE_PACKET, self.APPLICATION_ECHO],
+        )
+        self.assertCountEqual(
+            backend_packets,
+            [self.CLIENT_HANDSHAKE_PACKET, self.APPLICATION_PAYLOAD],
+        )
+
+    def test_handshake_packets_are_ignored_with_ignore_first_packet(self):
+        self.start_handshake_phantun(ignore_client=True, ignore_server=True)
+
+        client_packets = self.run_in_client(self._do_client_round_trip, 1)
+        backend_packets = self.collect_backend_packets(1)
+
+        self.assertEqual(client_packets, [self.APPLICATION_ECHO])
+        self.assertEqual(backend_packets, [self.APPLICATION_PAYLOAD])
+
 
 if __name__ == '__main__':
     setup_userns()

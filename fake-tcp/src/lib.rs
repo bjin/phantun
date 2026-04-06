@@ -45,14 +45,14 @@ pub mod packet;
 use bytes::{Bytes, BytesMut};
 use log::{error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -181,6 +181,14 @@ impl Socket {
         }
     }
 
+    /// Returns the next sequence number expected from the remote peer.
+    ///
+    /// Immediately after the fake-TCP handshake completes this is the sequence number
+    /// the peer will use for its first data packet.
+    pub fn next_remote_seq(&self) -> u32 {
+        self.ack.load(Ordering::Relaxed)
+    }
+
     /// Attempt to receive a datagram from the other end.
     ///
     /// This method takes `&self`, and it can be called safely by multiple threads
@@ -189,6 +197,17 @@ impl Socket {
     /// A return of `None` means the TCP connection is broken
     /// and this socket must be closed.
     pub async fn recv(&self, buf: &mut [u8]) -> Option<usize> {
+        self.recv_with_seq(buf).await.map(|(size, _sequence)| size)
+    }
+
+    /// Attempt to receive a datagram from the other end and return its TCP sequence.
+    ///
+    /// This method takes `&self`, and it can be called safely by multiple threads
+    /// at the same time.
+    ///
+    /// A return of `None` means the TCP connection is broken
+    /// and this socket must be closed.
+    pub async fn recv_with_seq(&self, buf: &mut [u8]) -> Option<(usize, u32)> {
         match self.state {
             State::Established => {
                 self.incoming.recv_async().await.ok().and_then(|raw_buf| {
@@ -200,8 +219,9 @@ impl Socket {
                     }
 
                     let payload = tcp_packet.payload();
+                    let sequence = tcp_packet.get_sequence();
 
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                    let new_ack = sequence.wrapping_add(payload.len() as u32);
                     let last_ask = self.last_ack.load(Ordering::Relaxed);
                     self.ack.store(new_ack, Ordering::Relaxed);
 
@@ -216,7 +236,7 @@ impl Socket {
 
                     buf[..payload.len()].copy_from_slice(payload);
 
-                    Some(payload.len())
+                    Some((payload.len(), sequence))
                 })
             }
             _ => unreachable!(),

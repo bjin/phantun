@@ -1,14 +1,14 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
+use phantun::handshake_packet::HandshakePacketTracker;
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
@@ -113,7 +113,7 @@ async fn main() -> io::Result<()> {
             Arg::new("ignore_first_packet")
                 .long("ignore-first-packet")
                 .required(false)
-                .help("Ignore first packet from server")
+                .help("Ignore the server handshake packet")
                 .action(ArgAction::SetTrue)
         )
         .get_matches();
@@ -194,7 +194,8 @@ async fn main() -> io::Result<()> {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
@@ -226,11 +227,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -239,14 +242,16 @@ async fn main() -> io::Result<()> {
             let incoming_packet_received = Arc::new(Notify::new());
             let outgoing_packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
-            let ignore_next_packet = Arc::new(AtomicBool::new(ignore_first_packet));
+            let handshake_packet_tracker = Arc::new(HandshakePacketTracker::new(
+                ignore_first_packet.then_some(sock.next_remote_seq()),
+            ));
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let incoming_packet_received = incoming_packet_received.clone();
                 let outgoing_packet_received = outgoing_packet_received.clone();
-                let ignore_next_packet = ignore_next_packet.clone();
+                let handshake_packet_tracker = handshake_packet_tracker.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -260,10 +265,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -274,7 +276,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);
@@ -291,12 +295,12 @@ async fn main() -> io::Result<()> {
 
                                 outgoing_packet_received.notify_one();
                             },
-                            res = sock.recv(&mut buf_tcp) => {
+                            res = sock.recv_with_seq(&mut buf_tcp) => {
                                 match res {
-                                    Some(size) => {
+                                    Some((size, sequence)) => {
                                         if size > 0 {
-                                            if ignore_next_packet.swap(false, Ordering::Relaxed) {
-                                                debug!("Ignored first packet from server");
+                                            if handshake_packet_tracker.should_drop(sequence) {
+                                                debug!("Ignored handshake packet from server with sequence {}", sequence);
                                             } else if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
